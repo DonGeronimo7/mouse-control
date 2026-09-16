@@ -1,5 +1,5 @@
 Name:           mouse-control
-Version:        0.8.0
+Version:        0.8.2
 Release:        1%{?dist}
 Summary:        Mouse remapping with optional hardware backends
 License:        GPL-3.0-or-later
@@ -60,17 +60,29 @@ sed -i '\|__pycache__|d' %{pyproject_files}
 /usr/bin/python3 -m compileall -q src tests
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=%{buildroot}%{python3_sitelib} \
   %{buildroot}%{_bindir}/mouse-control --help
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=%{buildroot}%{python3_sitelib} \
+  %{buildroot}%{_bindir}/mouse-control-discover --help
 
 %files -f %{pyproject_files}
 %license LICENSE
 %doc README.md CHANGELOG.md
 %doc docs/COMPATIBILITY.md
 %{_bindir}/mouse-control
+%{_bindir}/mouse-control-discover
 %{_udevrulesdir}/71-mouse-control-uaccess.rules
 %{_datadir}/applications/mouse-control.desktop
 %{_datadir}/icons/hicolor/*/apps/mouse-control.png
 
 %changelog
+* Tue Sep 15 2026 Marc-Anthony Geronimo - 0.8.2-1
+- Stabilize native hardware control and reconnect fallback behavior.
+- Preserve remaps and setup configuration while hardware options are reviewed.
+
+* Mon Sep 14 2026 Marc-Anthony Geronimo - 0.8.1-1
+- Add revisitable wizard navigation, live numeric DPI testing, and safe rollback.
+- Show readable polling rates and select only when writes are supported.
+- Persist accepted DPI stages for runtime cycling.
+
 * Mon Sep 14 2026 Marc-Anthony Geronimo - 0.8.0-1
 - Add held keyboard chord bindings with shared-modifier and disconnect cleanup.
 - Allow an explicit configuration file for isolated runtime testing.
@@ -92,10 +104,10 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=%{buildroot}%{python3_sitelib} \
 - Fall back to the validated GitHub package when native repositories do not
   actually upgrade a direct-release installation.
 
-* Sun Sep 14 2026 Marc-Anthony Geronimo - 0.7.7-1
+* Mon Sep 14 2026 Marc-A. Geronimo - 0.7.7-1
 - Polish the terminal launcher mark and strengthen icon visibility at small sizes.
 
-* Sun Sep 14 2026 Marc-A. Geronimo - 0.7.6-1
+* Mon Sep 14 2026 Marc-A. Geronimo - 0.7.6-1
 - Fix Arch build dependencies for the updater release.
 
 * Sun Sep 13 2026 Marc-A. Geronimo - 0.7.5-1

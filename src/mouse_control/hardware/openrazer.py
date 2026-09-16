@@ -1,6 +1,7 @@
 """Optional OpenRazer Python/session-D-Bus adapter; no lighting or profiles."""
 from functools import wraps
 from .base import HardwareBackend, HardwareError
+from .capabilities import DpiState
 from ..discovery import MouseDevice
 
 
@@ -79,7 +80,7 @@ class OpenRazerBackend(HardwareBackend):
         return [int(v) for v in target.available_dpi] if target.has("available_dpi") else []
 
     @_library_errors
-    def set_dpi(self, device: MouseDevice, dpi: int) -> None:
+    def set_dpi(self, device: MouseDevice, dpi: int) -> DpiState:
         target = self._device(device)
         if not self.supports_dpi(device):
             raise HardwareError("OpenRazer: DPI is unsupported")
@@ -87,6 +88,10 @@ class OpenRazerBackend(HardwareBackend):
         if dpi <= 0 or dpi > target.max_dpi or (values and dpi not in values):
             raise HardwareError(f"OpenRazer: unsupported DPI {dpi}")
         target.dpi = (dpi, 0 if target.has("available_dpi") else dpi)
+        actual = self.get_dpi(device)
+        if actual is None or actual[0] != dpi or actual[1] not in (0, dpi):
+            raise HardwareError(f"OpenRazer: DPI verification failed: requested {dpi}, read {actual}")
+        return DpiState(actual[0], actual[1], confirmed=True)
 
     @_library_errors
     def supports_polling_rate(self, device: MouseDevice) -> bool:
@@ -106,10 +111,22 @@ class OpenRazerBackend(HardwareBackend):
         return [int(v) for v in target.supported_poll_rates] if target.has("supported_poll_rates") else []
 
     @_library_errors
-    def set_polling_rate(self, device: MouseDevice, hz: int) -> None:
+    def set_polling_rate(self, device: MouseDevice, hz: int) -> int:
         if not self.supports_polling_rate(device):
             raise HardwareError("OpenRazer: polling rate is unsupported")
         rates = self.get_polling_rates(device)
         if hz <= 0 or (rates and hz not in rates):
             raise HardwareError(f"OpenRazer: unsupported polling rate {hz}")
         self._device(device).poll_rate = hz
+        actual = self.get_polling_rate(device)
+        if actual != hz:
+            raise HardwareError(
+                f"OpenRazer: polling-rate verification failed: requested {hz}, read {actual}")
+        return actual
+
+    def close(self) -> None:
+        self._devices.clear()
+        manager, self._manager = self._manager, None
+        close = getattr(manager, "close", None)
+        if close:
+            close()

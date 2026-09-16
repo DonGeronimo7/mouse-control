@@ -59,7 +59,7 @@ def parse_action(value: str) -> Action:
 
 
 class DpiCycler:
-    """Own the authoritative stage for application-driven DPI cycling."""
+    """Cycle configured stages while retaining the confirmed hardware DPI."""
 
     def __init__(self, backend: HardwareBackend, device: MouseDevice, stages: list[int],
                  current_dpi: int, notifications_enabled: bool = True,
@@ -68,18 +68,31 @@ class DpiCycler:
         self.device = device
         self.stages = stages
         self.current_dpi = current_dpi
+        self.current_dpi_confirmed = False
+        # An off-list starting DPI advances to the first configured stage.
+        self._stage_index = stages.index(current_dpi) if current_dpi in stages else -1
+        self._cycle_lock = threading.Lock()
         self.notifications_enabled = notifications_enabled
         self.notifier = notifier if notifier is not None else FreedesktopNotifier()
 
     def cycle(self) -> bool:
+        with self._cycle_lock:
+            return self._cycle()
+
+    def observe_dpi(self, dpi: int | tuple[int, int]) -> None:
+        """Use a confirmed external DPI change to place the software cursor."""
+        with self._cycle_lock:
+            self.current_dpi = dpi
+            self.current_dpi_confirmed = True
+            self._stage_index = self.stages.index(dpi) if dpi in self.stages else -1
+            self._record_desired_dpi(dpi)
+
+    def _cycle(self) -> bool:
         if not self.stages:
             LOG.warning("DPI cycle ignored: no configured stages")
             return False
-        try:
-            index = self.stages.index(self.current_dpi)
-        except ValueError:
-            index = -1
-        next_dpi = self.stages[(index + 1) % len(self.stages)]
+        next_index = (self._stage_index + 1) % len(self.stages)
+        next_dpi = self.stages[next_index]
         try:
             if not self.backend.supports_dpi(self.device):
                 LOG.warning("DPI cycle ignored: %s does not support DPI control", self.backend.name)
@@ -89,18 +102,50 @@ class DpiCycler:
             LOG.warning("Could not set DPI to %s through %s: %s",
                         next_dpi, self.backend.name, exc)
             return False
-        actual_dpi = (confirmed.display_value
-                      if isinstance(confirmed, DpiState) else next_dpi)
-        if not isinstance(actual_dpi, int):
-            LOG.warning("DPI cycle produced independent X/Y DPI; using X axis")
-            actual_dpi = actual_dpi[0]
+        state_confirmed = isinstance(confirmed, DpiState) and confirmed.confirmed
+        actual_dpi = confirmed.display_value if state_confirmed else None
+        if actual_dpi is None:
+            try:
+                readback = self.backend.get_dpi(self.device)
+            except Exception as exc:
+                LOG.warning("Could not read DPI after cycle through %s: %s",
+                            self.backend.name, exc)
+                readback = None
+            if isinstance(readback, (int, tuple)):
+                actual_dpi = readback
+                state_confirmed = True
+        if actual_dpi is None:
+            # Legacy setters without readback remain usable, but are explicitly
+            # represented as requested/unconfirmed state.
+            actual_dpi = next_dpi
+        if state_confirmed and not self._dpi_matches(actual_dpi, next_dpi):
+            LOG.warning("DPI cycle verification failed: requested %s, read %s",
+                        next_dpi, actual_dpi)
+            return False
         self.current_dpi = actual_dpi
+        self.current_dpi_confirmed = state_confirmed
+        self._stage_index = next_index
+        self._record_desired_dpi(actual_dpi)
         if self.notifications_enabled:
             try:
-                self.notifier.notify_dpi(actual_dpi)
+                deliberate = (self.notifier.notify_deliberate_dpi
+                              if callable(getattr(type(self.notifier), "notify_deliberate_dpi", None))
+                              else None)
+                (deliberate or self.notifier.notify_dpi)(actual_dpi)
             except Exception as exc:
                 LOG.warning("Desktop DPI notification failed: %s", exc)
         return True
+
+    @staticmethod
+    def _dpi_matches(actual_dpi, requested):
+        if isinstance(actual_dpi, tuple):
+            return actual_dpi[0] == requested and actual_dpi[1] in (0, requested)
+        return actual_dpi == requested
+
+    def _record_desired_dpi(self, dpi):
+        record = getattr(type(self.backend), "record_active_dpi", None)
+        if callable(record):
+            record(self.backend, dpi)
 
 
 class MouseRemapper:

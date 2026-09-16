@@ -195,6 +195,11 @@ def test_wizard_capture_cancel_and_manual_entry(capsys):
         assert ask_for_action('BTN_EXTRA') == 'key:KEY_F12'
 
 
+def test_wizard_offers_canonical_dpi_cycle_action():
+    with patch('builtins.input', return_value='8'):
+        assert ask_for_action('BTN_FORWARD') == 'dpi-cycle'
+
+
 def mouse_events(*items, cancel=True):
     for item in items:
         yield item

@@ -38,10 +38,9 @@ def discover_hid_devices(device: MouseDevice, *,
     type is included so the same dual-mode mouse can be inspected over USB or
     Bluetooth without treating those transports as interchangeable.
     """
-    if device.vendor is None or device.product is None:
+    if device.vendor is None or device.product is None or device.bustype is None:
         return []
-    bus = device.bustype if device.bustype is not None else 0x0003
-    expected = f"{bus:04X}:{device.vendor:08X}:{device.product:08X}"
+    expected = f"{device.bustype:04X}:{device.vendor:08X}:{device.product:08X}"
     matches: list[GenericHidDevice] = []
     for entry in sorted(sysfs.glob("hidraw*")):
         node = entry / "device"

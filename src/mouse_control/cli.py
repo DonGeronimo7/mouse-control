@@ -10,15 +10,20 @@ import subprocess
 import sys
 import threading
 
-from .config import DEFAULT_DPI, DEFAULT_DPI_STAGES, generate_config, get_config_path, load_config, save_config
+from .config import (DEFAULT_DPI, DEFAULT_DPI_STAGES, generate_config, get_config_path,
+                     load_config, merge_setup_config, save_config)
 from .discovery import MouseDevice, get_mouse_devices, select_mouse_device
-from .hardware import HardwareBackend, HardwareError, get_backend
+from .hardware import (DesiredHardwareState, HardwareBackend, HardwareError,
+                       HardwareSupervisor, get_backend)
+from .hardware.generic import GenericBackend
 from .remapper import DpiCycler, MouseRemapper
 from .notifications import DpiMonitorSupervisor
 from .battery import BatteryMonitorSupervisor
 from .hidpp_debug import debug_dpi
 from .generic_hid import capture_input_reports, discover_hid_devices
 from .wizard import ButtonCaptureError, map_mouse_buttons
+from .setup_flow import (SetupChoices, discover_choices, restore_dpi, dpi_screen,
+                         polling_screen, review_screen)
 
 from .service import (install_service, is_service_active, start_service, stop_service,
                       restart_service, status_service, ServiceNotInstalled)
@@ -75,6 +80,47 @@ def _default_mappings() -> dict[str, str]:
         "BTN_RIGHT": "passthrough",
         "BTN_MIDDLE": "passthrough",
     }
+
+
+def _load_setup_config() -> dict[str, object]:
+    """Load an existing configuration once; absence means first-run defaults."""
+    path = get_config_path()
+    if not path.exists():
+        return {}
+    existing = load_config(path)
+    if not isinstance(existing, dict):
+        raise ValueError("Existing configuration is invalid")
+    return existing
+
+
+def _initial_mappings(existing: dict[str, object]) -> dict[str, str]:
+    """Keep an existing remap table intact until the wizard edits a button."""
+    if "remap" not in existing:
+        return _default_mappings()
+    mappings = existing["remap"]
+    if not isinstance(mappings, dict) or not all(
+            isinstance(button, str) and isinstance(action, str)
+            for button, action in mappings.items()):
+        raise ValueError("Existing [remap] configuration is invalid")
+    return dict(mappings)
+
+
+def _initial_choices(existing: dict[str, object]) -> SetupChoices:
+    dpi = existing.get("dpi", {})
+    polling = existing.get("polling", {})
+    if not isinstance(dpi, dict) or not isinstance(polling, dict):
+        raise ValueError("Existing DPI or polling configuration is invalid")
+    stages = dpi.get("stages", DEFAULT_DPI_STAGES)
+    active = dpi.get("active", DEFAULT_DPI)
+    if (not isinstance(stages, list) or
+            any(not isinstance(value, int) or value <= 0 for value in stages) or
+            not isinstance(active, int) or active <= 0):
+        raise ValueError("Existing DPI configuration is invalid")
+    rate = polling.get("rate_hz")
+    if rate is not None and (not isinstance(rate, int) or rate <= 0):
+        raise ValueError("Existing polling configuration is invalid")
+    return SetupChoices(stages=list(stages), active_dpi=active, polling_rate=rate,
+                        mappings=_initial_mappings(existing))
 
 
 def debug_hid(seconds: float = 10.0) -> int:
@@ -200,7 +246,8 @@ def _select_max_polling_rate(backend: HardwareBackend, device: MouseDevice) -> i
 
     maximum = max(supported)
     print(f"Supported polling rates: {', '.join(str(value) + ' Hz' for value in supported)}")
-    print(f"Setting polling rate to maximum: {maximum} Hz")
+    print(f"Selected maximum polling rate for setup: {maximum} Hz")
+    print("The wizard will report separately whether the hardware write is verified.")
     return maximum
 
 def _ask_enable_service() -> bool:
@@ -226,6 +273,10 @@ def run_setup_wizard() -> int:
     print("Native HID discovery enabled; unsupported mice retain generic remapping.")
     was_active = is_service_active()
     service_restored = False
+    selected = None
+    backend = None
+    choices = None
+    saved = False
     if was_active:
         print("Mouse Control background service is running.")
         print("Temporarily stopping it for setup...")
@@ -256,31 +307,99 @@ def run_setup_wizard() -> int:
                 print(f"Hardware name: {hardware_name}{identity}")
         except HardwareError as exc:
             logging.info("Hardware name lookup unavailable: %s", exc)
-        mappings = _default_mappings()
-        mappings.update(map_mouse_buttons(selected.path))
-        dpi_stages = DEFAULT_DPI_STAGES
-        active_dpi = DEFAULT_DPI
-        polling_rate_hz: int | None = None
-        try:
-            if backend.supports_dpi(selected):
-                dpi_stages, active_dpi = _choose_default_dpi(backend, selected)
-        except HardwareError as exc:
-            logging.warning("DPI capability query failed: %s", exc)
-        try:
-            if backend.supports_polling_rate(selected):
-                polling_rate_hz = _select_max_polling_rate(backend, selected)
-        except HardwareError as exc:
-            logging.warning("Polling capability query failed: %s", exc)
-
-        enable_service = _ask_enable_service()
-        content = generate_config(
-            selected, mappings, dpi_stages=dpi_stages, active_dpi=active_dpi,
-            polling_rate_hz=polling_rate_hz,
-        )
+        existing_config = _load_setup_config()
+        choices = _initial_choices(existing_config)
+        discover_choices(backend, selected, choices)
+        page = 'buttons'
+        review_return = False
+        finished = False
+        while not finished:
+            if page == 'buttons':
+                print('\nButton mappings: press buttons to configure; Ctrl+C ends capture.')
+                print('[Enter] Configure buttons  [S] Skip/keep mappings  [B] Back  [Q] Cancel setup')
+                answer = input('> ').strip().lower()
+                if answer == 'q':
+                    break
+                if answer == 'b':
+                    replacement = select_mouse_device(mice)
+                    if replacement is None:
+                        break
+                    if replacement != selected:
+                        restore_dpi(backend, selected, choices.original_dpi)
+                        selected = replacement
+                        backend = get_backend(selected)
+                        choices = _initial_choices(existing_config)
+                        discover_choices(backend, selected, choices)
+                        review_return = False
+                    continue
+                if answer not in ('', 'e', 'edit', 's', 'skip'):
+                    print('Press Enter, S, B, or Q.')
+                    continue
+                if answer in ('', 'e', 'edit'):
+                    choices.mappings.update(map_mouse_buttons(selected.path))
+                page = 'review' if review_return else 'dpi'
+            elif page == 'dpi':
+                action = dpi_screen(backend, selected, choices)
+                if action == 'q':
+                    break
+                page = ('review' if review_return else 'buttons') if action == 'b' else 'review' if review_return else 'polling'
+            elif page == 'polling':
+                action = polling_screen(choices)
+                if action == 'q':
+                    break
+                page = ('review' if review_return else 'dpi') if action == 'b' else 'review' if review_return else 'service'
+            elif page == 'service':
+                print('\nEnable Mouse Control at login?')
+                print('[Enter/Y] Yes  [N] No  [B] Back  [Q] Cancel setup')
+                answer = input('> ').strip().lower()
+                if answer == 'q':
+                    break
+                if answer == 'b':
+                    page = 'polling'
+                elif answer in ('', 'y', 'yes', 'n', 'no'):
+                    choices.enable_service = answer not in ('n', 'no')
+                    page = 'review'
+                else:
+                    print('Choose Y, N, B, or Q.')
+            else:
+                action = review_screen(selected, choices)
+                if action == 'q':
+                    break
+                if action == 'b':
+                    review_return = False
+                    page = 'service'
+                elif action in ('1', '2', '3'):
+                    review_return = True
+                    page = {'1': 'dpi', '2': 'polling', '3': 'buttons'}[action]
+                else:
+                    finished = True
+        if not finished:
+            restore_dpi(backend, selected, choices.original_dpi)
+            print('Setup cancelled; the existing configuration was not changed.')
+            return 0
+        dpi_stages = choices.stages
+        active_dpi = choices.active_dpi
+        polling_rate_hz = choices.polling_rate
+        mappings = choices.mappings
+        enable_service = choices.enable_service
+        if any(not isinstance(v, int) or v <= 0 for v in dpi_stages):
+            raise ValueError('Invalid DPI stages')
+        if (choices.dpi_changed and choices.dpi_values and
+                any(v not in choices.dpi_values for v in dpi_stages)):
+            raise ValueError('One or more DPI stages are unsupported by this mouse')
+        if (choices.polling_changed and polling_rate_hz is not None and
+                polling_rate_hz not in choices.polling_rates):
+            raise ValueError('Polling rate is unsupported by this mouse')
+        content = merge_setup_config(existing_config, selected, mappings=mappings,
+                                     dpi_stages=dpi_stages, active_dpi=active_dpi,
+                                     polling_rate_hz=polling_rate_hz)
         _apply_hardware(
-            backend, selected, dpi_stages, active_dpi, polling_rate_hz, setup=True
+            backend, selected, dpi_stages if choices.dpi_changed else [],
+            active_dpi if choices.dpi_changed else 0,
+            polling_rate_hz if choices.polling_changed else None, setup=True
         )
         path = save_config(content)
+        saved = True
         print(f"\nConfiguration saved to: {path}")
 
         if enable_service:
@@ -308,6 +427,8 @@ def run_setup_wizard() -> int:
         print("The existing configuration was not changed.", file=sys.stderr)
         return 1
     finally:
+        if not saved and selected is not None and backend is not None and choices is not None:
+            restore_dpi(backend, selected, choices.original_dpi)
         if was_active and not service_restored:
             try:
                 restart_service()
@@ -322,6 +443,7 @@ def _apply_hardware(backend: HardwareBackend, device: MouseDevice,
     """Apply independent capabilities; a hardware failure never blocks remapping."""
     try:
         if active_dpi > 0 and backend.supports_dpi(device):
+            applied_directly = False
             if backend.supports_dpi_stages(device):
                 slot = backend.apply_dpi_stages(device, stages, active_dpi)
                 if slot is not None:
@@ -331,17 +453,67 @@ def _apply_hardware(backend: HardwareBackend, device: MouseDevice,
                     print("Warning: the mouse did not expose a resolution slot for the requested active DPI.")
                 else:
                     backend.set_dpi(device, active_dpi)
+                    applied_directly = True
             else:
                 backend.set_dpi(device, active_dpi)
+                applied_directly = True
+            if applied_directly:
+                actual = backend.get_dpi(device)
+                matches = (actual == active_dpi or
+                           isinstance(actual, tuple) and actual[0] == active_dpi and
+                           actual[1] in (0, active_dpi))
+                if actual is None:
+                    print(f"Hardware DPI requested at {active_dpi} through {backend.name}; "
+                          "readback is unavailable.")
+                elif matches:
+                    print(f"Hardware DPI set and verified at {active_dpi} through {backend.name}.")
+                else:
+                    raise HardwareError(
+                        f"DPI verification requested {active_dpi}, read {actual}")
+        elif setup and active_dpi > 0:
+            print(f"DPI control is unsupported by {backend.name}; hardware DPI was unchanged.")
     except HardwareError as exc:
         logging.warning("Could not apply %s DPI settings: %s", backend.name, exc)
 
     try:
         if polling_rate_hz is not None and backend.supports_polling_rate_writes(device):
             backend.set_polling_rate(device, int(polling_rate_hz))
-            print(f"Hardware polling rate set to {polling_rate_hz} Hz through {backend.name}.")
+            actual = backend.get_polling_rate(device)
+            if actual is None:
+                print(f"Hardware polling rate requested at {polling_rate_hz} Hz through "
+                      f"{backend.name}; readback is unavailable.")
+            elif actual == int(polling_rate_hz):
+                print(f"Hardware polling rate set and verified at {actual} Hz through {backend.name}.")
+            else:
+                raise HardwareError(
+                    f"polling verification requested {polling_rate_hz} Hz, read {actual} Hz")
+        elif setup and polling_rate_hz is not None:
+            print(f"Polling-rate writes are unsupported by {backend.name}; hardware was unchanged.")
     except (HardwareError, ValueError, TypeError) as exc:
         logging.warning("Could not apply %s polling settings: %s", backend.name, exc)
+
+
+def _resolve_runtime_device(configured: MouseDevice) -> MouseDevice:
+    """Resolve reconnect identity without guessing among matching devices."""
+    mice = get_mouse_devices()
+    by_path = [mouse for mouse in mice
+               if os.path.realpath(mouse.path) == os.path.realpath(configured.path) and
+               (configured.vendor is None or mouse.vendor == configured.vendor) and
+               (configured.product is None or mouse.product == configured.product) and
+               (configured.bustype is None or mouse.bustype == configured.bustype)]
+    if len(by_path) == 1:
+        return by_path[0]
+    if configured.vendor is None or configured.product is None:
+        return configured
+    candidates = [mouse for mouse in mice
+                  if mouse.vendor == configured.vendor and
+                  mouse.product == configured.product and
+                  (configured.bustype is None or mouse.bustype == configured.bustype)]
+    if configured.phys:
+        physical = [mouse for mouse in candidates if mouse.phys == configured.phys]
+        if len(physical) == 1:
+            return physical[0]
+    return candidates[0] if len(candidates) == 1 else configured
 
 
 def run_from_config(path: Path | None = None) -> int:
@@ -378,7 +550,6 @@ def run_from_config(path: Path | None = None) -> int:
         bustype=device.get("bustype") if isinstance(device.get("bustype"), int) else None,
     )
     monitor = None
-    battery_monitor = None
     dpi_cycler = None
     shutdown_event = threading.Event()
     enabled = config.get("notifications", {}).get("dpi_changes", True)
@@ -387,26 +558,38 @@ def run_from_config(path: Path | None = None) -> int:
     else:
         logging.warning("Invalid notifications.dpi_changes; using enabled default")
         notifications_enabled = True
+    cycle_device = mouse or configured_mouse
+    g305_hidpp = (cycle_device.vendor == 0x046d and cycle_device.product == 0x4074 and
+                   cycle_device.bustype in (None, 3))
+    hardware_device = mouse or configured_mouse
+    initial_backend = get_backend(hardware_device, log_failures=mouse is not None)
+    hardware = HardwareSupervisor(
+        initial_backend, hardware_device,
+        lambda selected: get_backend(selected, log_failures=False),
+        DesiredHardwareState(active_dpi=active_dpi,
+                             dpi_stages=tuple(dpi_stages),
+                             polling_rate_hz=polling_rate_hz),
+        device_resolver=_resolve_runtime_device,
+        discovery_pending=mouse is None or isinstance(initial_backend, GenericBackend))
     if mouse is not None:
-        backend = get_backend(mouse)
         identity = (f"{mouse.vendor:04x}:{mouse.product:04x}"
                     if mouse.vendor is not None and mouse.product is not None
                     else "identity unavailable")
         LOG.info("Selected mouse: %s (%s, %s)", mouse.name, mouse.path, identity)
-        LOG.info("Selected hardware backend: %s (%s)", backend.name,
-                 type(backend).__name__)
-        _apply_hardware(backend, mouse, dpi_stages, active_dpi, polling_rate_hz)
-        if "dpi-cycle" in mappings.values():
-            dpi_cycler = DpiCycler(backend, mouse, dpi_stages, active_dpi,
-                                   notifications_enabled)
+        LOG.info("Selected hardware backend: %s (%s)", initial_backend.name,
+                 type(initial_backend).__name__)
+    hardware.reconcile()
+    if "dpi-cycle" in mappings.values() or g305_hidpp:
+        dpi_cycler = DpiCycler(hardware, hardware_device, dpi_stages, active_dpi,
+                               notifications_enabled)
 
-    if notifications_enabled:
-        monitor_device = mouse or configured_mouse
-        if mouse is None:
-            backend = get_backend(monitor_device)
-        monitor = DpiMonitorSupervisor(backend, monitor_device,
-                                       lambda device: get_backend(device, log_failures=False),
-                                       dpi_stages, active_dpi, shutdown_event)
+    if notifications_enabled or g305_hidpp:
+        monitor_kwargs = ({"dpi_cycler": dpi_cycler,
+                           "notifications_enabled": notifications_enabled}
+                          if g305_hidpp else {})
+        monitor = DpiMonitorSupervisor(hardware, hardware_device,
+                                       lambda _device: hardware,
+                                       dpi_stages, active_dpi, shutdown_event, **monitor_kwargs)
         if dpi_cycler is not None:
             dpi_cycler.notifier = monitor
         LOG.info("DPI notification monitor: %s", type(monitor).__name__)
@@ -415,11 +598,8 @@ def run_from_config(path: Path | None = None) -> int:
 
     # Battery is a separate optional capability.  Its failures must remain
     # invisible to the evdev/uinput remapper.
-    battery_device = mouse or configured_mouse
-    battery_backend = backend if mouse is not None else get_backend(battery_device, log_failures=False)
     battery_monitor = BatteryMonitorSupervisor(
-        battery_backend, battery_device,
-        lambda selected: get_backend(selected, log_failures=False), shutdown_event)
+        hardware, hardware_device, lambda _selected: hardware, shutdown_event)
 
     if monitor is not None:
         LOG.info("Starting DPI notification monitor")
@@ -432,6 +612,7 @@ def run_from_config(path: Path | None = None) -> int:
         if monitor is not None:
             monitor.stop()
         battery_monitor.stop()
+        hardware.close()
     return 0
 
 

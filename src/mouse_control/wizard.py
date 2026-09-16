@@ -82,6 +82,7 @@ def ask_for_action(symbolic_name: str) -> str:
     print("  5. Enter a keyboard key code manually")
     print("  6. Remap to keyboard chord")
     print("  7. Enter a keyboard chord manually")
+    print("  8. Cycle configured DPI stages")
 
     while True:
         try:
@@ -113,7 +114,9 @@ def ask_for_action(symbolic_name: str) -> str:
             return _ask_chord_action()
         if choice == "4":
             return "disable"
-        print("Please choose 1, 2, 3, 4, 5, 6, or 7.")
+        if choice == "8":
+            return "dpi-cycle"
+        print("Please choose 1, 2, 3, 4, 5, 6, 7, or 8.")
 
 
 def map_mouse_buttons(device_path: str) -> dict[str, str]:

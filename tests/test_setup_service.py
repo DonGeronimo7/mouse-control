@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 from unittest.mock import Mock, patch
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
@@ -14,10 +15,18 @@ from mouse_control.wizard import ButtonCaptureError
 MOUSE = MouseDevice("Test Mouse", "/dev/input/test", vendor=1, product=2)
 
 
+@pytest.fixture(autouse=True)
+def wizard_answers(request):
+    service = "" if request.node.name in ("test_existing_autostart_flow_starts_once_without_duplicate_restart", "test_inactive_service_autostart_uses_existing_install_flow_once") else "n"
+    with patch('builtins.input', side_effect=['e', '', '', service, '']):
+        yield
+
+
 def setup_patches(*, active=False, selected=MOUSE, capture=None, autostart=False):
     backend = Mock()
     backend.supports_dpi.return_value = False
     backend.supports_polling_rate.return_value = False
+    backend.supports_polling_rate_writes.return_value = False
     return (
         backend,
         patch.object(cli, "is_service_active", return_value=active),
@@ -99,8 +108,8 @@ def test_prompt_cancellation_after_capture_does_not_commit_config():
     with contexts[0], contexts[1], contexts[2], contexts[3], contexts[4], \
          contexts[5] as ask, contexts[6], contexts[7] as save, contexts[8], \
          contexts[9] as restart, contexts[10]:
-        ask.side_effect = KeyboardInterrupt
-        assert cli.run_setup_wizard() == 1
+        with patch("builtins.input", side_effect=["", "", "", KeyboardInterrupt]):
+            assert cli.run_setup_wizard() == 1
     save.assert_not_called()
     restart.assert_called_once()
 

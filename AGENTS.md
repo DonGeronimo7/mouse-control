@@ -24,6 +24,31 @@ failed hardware backend must never prevent ordinary remapping from starting.
 - Do not broaden hidraw udev access. Add exact, reviewed device/interface rules
   after the relevant VID:PID and driver path are known.
 
+## Automatic hardware discovery invariants
+
+- Discovery learns hardware; it does not guess hardware.
+- Unknown hardware is observed before it is modified. Generic discovery must
+  never issue SET_REPORT, HIDIOCSFEATURE, HIDIOCSOUTPUT, HIDIOCSINPUT, or raw
+  hidraw writes.
+- `/dev/hidrawN` and `/dev/input/eventN` are live interfaces, never persistent
+  hardware identities.
+- A USB/sysfs parent path is a connection location, not an instance identity.
+  Only a true device-unique identifier may identify one physical instance.
+- VID:PID alone may not authorize writes when multiple physical candidates
+  exist. Ambiguous physical or protocol matches must refuse writes.
+- Descriptor shape and changing bytes are evidence, not vendor semantics.
+  Writable capability claims require `EvidenceLevel.PROVEN` evidence from a
+  validated protocol implementation.
+- Known-protocol feature indexes remain dynamic when the protocol exposes a
+  discovery mechanism; HID++ feature IDs are resolved through ROOT.
+- Capability failures remain independent. Failure to discover DPI must not
+  erase report-rate, battery, button, or other independently proven support.
+- Discovery profiles must be path-independent and may cache only proven facts;
+  runtime backends still enforce their own write policy.
+- Do not make automatic discovery part of `mouse-control run` or setup until
+  the G305 physical acceptance test validates topology grouping and exactly one
+  protocol responder.
+
 ## Current backend policy
 
 - Use the native HID session and protocol drivers for validated hardware

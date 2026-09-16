@@ -79,8 +79,22 @@ class HardwareBackend(ABC):
         return False
 
     def supports_polling_rate_writes(self, device: MouseDevice) -> bool:
-        """Return whether polling/report-rate writes are supported."""
+        """Return whether a proven execution path can write the report rate.
+
+        This may include an explicit control-mode takeover. Discovery and
+        automatic lifecycle code must use
+        :meth:`supports_polling_rate_writes_without_takeover` instead.
+        """
         return False
+
+    def supports_polling_rate_writes_without_takeover(self, device: MouseDevice) -> bool:
+        """Return whether polling can be written without changing control ownership.
+
+        The default is equivalent to ordinary write support. Backends with a
+        native/onboard versus host/software mode split must override this and
+        return False while a write would require taking ownership from firmware.
+        """
+        return self.supports_polling_rate_writes(device)
 
     def get_polling_rate(self, device: MouseDevice) -> int | None:
         return None
@@ -90,3 +104,7 @@ class HardwareBackend(ABC):
 
     def set_polling_rate(self, device: MouseDevice, hz: int) -> None:
         raise HardwareError(f"{self.name}: polling rate is unsupported")
+
+    def close(self) -> None:
+        """Release backend resources. Implementations may safely call twice."""
+        return None

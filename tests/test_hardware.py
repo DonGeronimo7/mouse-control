@@ -14,7 +14,8 @@ from mouse_control.hardware.generic import GenericBackend
 from mouse_control.hardware.native_hid import NativeHidBackend
 from mouse_control.hardware.openrazer import OpenRazerBackend
 
-G305 = MouseDevice("G305", "/dev/input/test", vendor=0x046d, product=0x4074)
+G305 = MouseDevice("G305", "/dev/input/test", vendor=0x046d, product=0x4074,
+                   bustype=3)
 RAZER = MouseDevice("Razer", "/dev/input/test", vendor=0x1532, product=0x0099)
 
 
@@ -46,6 +47,16 @@ def test_transient_backend_enumeration_failure_falls_back_without_retry_log_spam
     caplog.clear()
     assert isinstance(get_backend(G305, [lambda: backend], log_failures=False), GenericBackend)
     assert "Hardware discovery failed" not in caplog.text
+
+
+def test_backend_registry_closes_rejected_and_failed_candidates():
+    rejected = Mock(spec=HardwareBackend)
+    rejected.supports_device.return_value = False
+    failed = Mock(spec=HardwareBackend)
+    failed.supports_device.side_effect = HardwareError("probe failed")
+    assert isinstance(get_backend(G305, [lambda: rejected, lambda: failed]), GenericBackend)
+    rejected.close.assert_called_once()
+    failed.close.assert_called_once()
 
 
 def test_native_hid_watcher_failure_propagates_to_supervisor():
@@ -84,24 +95,128 @@ def test_native_hid_refuses_ambiguous_interfaces_and_keeps_devices_distinct():
     assert len(backend._bound) == 2
 
 
-def test_native_hid_exposes_report_rate_read_and_write_separately():
-    capabilities = HardwareCapabilities(
-        report_rate=ReportRateCapabilities(
-            readable=True, writable=False, values=(1000, 500, 250, 125)))
-    driver = SimpleNamespace(name="G305", capabilities=capabilities,
-                             get_report_rate=Mock(return_value=1000),
-                             set_report_rate=Mock())
-    backend = NativeHidBackend(
+def test_native_hid_exposes_report_rate_read_and_validated_transition():
+    driver, _state = polling_driver(mode=1)
+    backend = native_backend_with_driver(driver)
+    assert backend.supports_polling_rate(G305)
+    assert backend.supports_polling_rate_writes(G305)
+    assert backend.get_polling_rates(G305) == [1000, 500, 250, 125]
+    assert backend.get_polling_rate(G305) == 500
+    backend.set_polling_rate(G305, 500)
+    driver.set_control_mode.assert_called_once_with(2)
+    driver.set_report_rate.assert_called_once_with(500)
+
+
+def native_backend_with_driver(driver):
+    return NativeHidBackend(
         discovery=lambda _device: [SimpleNamespace(path="/dev/fake")],
         session_factory=lambda _path: SimpleNamespace(closed=False, close=lambda: None),
         connectors=(lambda _session: driver,))
-    assert backend.supports_polling_rate(G305)
-    assert not backend.supports_polling_rate_writes(G305)
-    assert backend.get_polling_rates(G305) == [1000, 500, 250, 125]
-    assert backend.get_polling_rate(G305) == 1000
-    with pytest.raises(HardwareError, match="writes are unsupported"):
-        backend.set_polling_rate(G305, 500)
+
+
+def polling_driver(*, mode=1):
+    state = {"mode": mode}
+    caps = HardwareCapabilities(report_rate=ReportRateCapabilities(
+        readable=True, writable=True, values=(1000, 500, 250, 125)))
+    driver = SimpleNamespace(name="G305", capabilities=caps,
+                             get_report_rate=Mock(return_value=500),
+                             set_report_rate=Mock())
+    driver.get_control_mode = Mock(side_effect=lambda: state["mode"])
+    driver.set_control_mode = Mock(side_effect=lambda value: state.update(mode=value))
+    return driver, state
+
+
+def test_polling_transaction_already_host_does_not_change_mode():
+    driver, _state = polling_driver(mode=2)
+    native_backend_with_driver(driver).set_polling_rate(G305, 250)
+    driver.set_control_mode.assert_not_called()
+    driver.set_report_rate.assert_called_once_with(250)
+
+
+def test_polling_transaction_refuses_unknown_mouse_onboard_transition():
+    unknown = MouseDevice("Other Logitech", "/dev/input/test", vendor=0x046d,
+                          product=0x4080, bustype=3)
+    driver, _state = polling_driver(mode=1)
+    backend = native_backend_with_driver(driver)
+    assert not backend.supports_polling_rate_writes(unknown)
+    with pytest.raises(HardwareError, match="not validated"):
+        backend.set_polling_rate(unknown, 500)
+    driver.set_control_mode.assert_not_called()
     driver.set_report_rate.assert_not_called()
+
+
+def test_unknown_mouse_already_in_host_mode_may_use_report_rate():
+    unknown = MouseDevice("Other Logitech", "/dev/input/test", vendor=0x046d,
+                          product=0x4080, bustype=3)
+    driver, _state = polling_driver(mode=2)
+    backend = native_backend_with_driver(driver)
+    assert backend.supports_polling_rate_writes(unknown)
+    backend.set_polling_rate(unknown, 500)
+    driver.set_control_mode.assert_not_called()
+    driver.set_report_rate.assert_called_once_with(500)
+
+
+def test_polling_transaction_rejects_unadvertised_rate_before_mode_change():
+    driver, _state = polling_driver(mode=1)
+    with pytest.raises(HardwareError, match="unsupported polling rate"):
+        native_backend_with_driver(driver).set_polling_rate(G305, 2000)
+    driver.get_control_mode.assert_not_called()
+    driver.set_control_mode.assert_not_called()
+
+
+@pytest.mark.parametrize("rate_failure", [HardwareError("write failed"),
+                                           RuntimeError("write failed")])
+def test_polling_transaction_rolls_back_mode_after_rate_failure(rate_failure):
+    driver, state = polling_driver(mode=1)
+    driver.set_report_rate.side_effect = rate_failure
+    with pytest.raises((HardwareError, RuntimeError), match="write failed"):
+        native_backend_with_driver(driver).set_polling_rate(G305, 500)
+    assert state["mode"] == 1
+    assert [call.args[0] for call in driver.set_control_mode.call_args_list] == [2, 1]
+
+
+def test_polling_transaction_reports_rollback_failure():
+    driver, state = polling_driver(mode=1)
+    driver.set_report_rate.side_effect = HardwareError("write failed")
+    def set_mode(value):
+        if value == 1:
+            raise HardwareError("rollback failed")
+        state["mode"] = value
+    driver.set_control_mode.side_effect = set_mode
+    with pytest.raises(HardwareError, match="additionally failed.*rollback failed"):
+        native_backend_with_driver(driver).set_polling_rate(G305, 500)
+
+
+def test_polling_transaction_attempts_rollback_after_mode_set_failure():
+    driver, state = polling_driver(mode=1)
+    calls = []
+    def set_mode(value):
+        calls.append(value)
+        if value == 2:
+            raise HardwareError("mode set failed")
+        state["mode"] = value
+    driver.set_control_mode.side_effect = set_mode
+    with pytest.raises(HardwareError, match="mode set failed"):
+        native_backend_with_driver(driver).set_polling_rate(G305, 500)
+    assert calls == [2, 1]
+    assert state["mode"] == 1
+
+
+def test_polling_transaction_rolls_back_mode_on_host_readback_mismatch():
+    driver, state = polling_driver(mode=1)
+    readings = iter((1, 1, 1))
+    driver.get_control_mode.side_effect = lambda: next(readings)
+    with pytest.raises(HardwareError, match="Host mode verification failed"):
+        native_backend_with_driver(driver).set_polling_rate(G305, 500)
+    assert [call.args[0] for call in driver.set_control_mode.call_args_list] == [2, 1]
+    assert state["mode"] == 1
+
+
+def test_successful_polling_transaction_remains_in_host_mode():
+    driver, state = polling_driver(mode=1)
+    native_backend_with_driver(driver).set_polling_rate(G305, 125)
+    assert state["mode"] == 2
+    assert [call.args[0] for call in driver.set_control_mode.call_args_list] == [2]
 
 
 def test_hardware_apply_skips_nonwritable_report_rate():
@@ -110,6 +225,21 @@ def test_hardware_apply_skips_nonwritable_report_rate():
     backend.supports_polling_rate_writes.return_value = False
     cli._apply_hardware(backend, G305, [], 0, 1000)
     backend.set_polling_rate.assert_not_called()
+
+
+def test_runtime_device_resolution_rejects_reused_path_and_ambiguity():
+    configured = MouseDevice("G305", "/dev/input/event5", vendor=0x046d,
+                             product=0x4074, bustype=3)
+    wrong = MouseDevice("Other", configured.path, vendor=0x1234,
+                        product=0x5678, bustype=3)
+    one = MouseDevice("G305", "/dev/input/event8", vendor=0x046d,
+                      product=0x4074, bustype=3)
+    two = MouseDevice("G305", "/dev/input/event9", vendor=0x046d,
+                      product=0x4074, bustype=3)
+    with patch.object(cli, "get_mouse_devices", return_value=[wrong, one]):
+        assert cli._resolve_runtime_device(configured) == one
+    with patch.object(cli, "get_mouse_devices", return_value=[wrong, one, two]):
+        assert cli._resolve_runtime_device(configured) == configured
 
 
 def test_razer_backend_remains_available():
@@ -146,6 +276,23 @@ def test_openrazer_rejects_unreported_values_and_rates():
         backend.set_dpi(RAZER, 1500)
     with pytest.raises(HardwareError):
         backend.set_polling_rate(RAZER, 8000)
+
+
+def test_openrazer_writes_return_hardware_confirmed_readback():
+    target = razer_device()
+    backend = razer_backend(target)
+    state = backend.set_dpi(RAZER, 1600)
+    assert state.confirmed and state.display_value == 1600
+    assert backend.set_polling_rate(RAZER, 1000) == 1000
+
+
+def test_openrazer_close_releases_manager_and_cached_device():
+    manager = SimpleNamespace(devices=[razer_device()], close=Mock())
+    backend = OpenRazerBackend(lambda: manager)
+    assert backend.supports_device(RAZER)
+    backend.close()
+    manager.close.assert_called_once()
+    assert backend._manager is None and backend._devices == {}
 
 
 @pytest.mark.parametrize("unavailable", [False, True])

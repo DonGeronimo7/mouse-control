@@ -357,7 +357,7 @@ def test_editable_and_unknown_are_never_updated(monkeypatch, capsys):
         install = updater.Installation(kind, Path("/tmp/mouse-control"))
         monkeypatch.setattr(updater, "detect_installation", lambda _, value=install: value)
         monkeypatch.setattr(updater, "_shadowed", lambda _: None)
-        assert updater.run_update(check=False, assume_yes=True, fetcher=lambda: release("0.8.1")) == 1
+        assert updater.run_update(check=False, assume_yes=True, fetcher=lambda: release("0.8.3")) == 1
     assert "cannot be updated automatically" in capsys.readouterr().err
 
 
@@ -410,10 +410,10 @@ def test_successful_update_restarts_only_active_service(monkeypatch):
     monkeypatch.setattr(updater, "is_service_active", lambda: True)
     restarted = []
     monkeypatch.setattr(updater, "restart_service", lambda: restarted.append(True))
-    assert updater.run_update(assume_yes=True, fetcher=lambda: release("0.8.1"), runner=lambda _: result()) == 0
+    assert updater.run_update(assume_yes=True, fetcher=lambda: release("0.8.3"), runner=lambda _: result()) == 0
     assert restarted == [True]
     monkeypatch.setattr(updater, "is_service_active", lambda: False)
-    assert updater.run_update(assume_yes=True, fetcher=lambda: release("0.8.1"), runner=lambda _: result()) == 0
+    assert updater.run_update(assume_yes=True, fetcher=lambda: release("0.8.3"), runner=lambda _: result()) == 0
     assert restarted == [True]
 
 
@@ -423,6 +423,6 @@ def test_failed_service_restart_does_not_claim_install_failed(monkeypatch, capsy
     monkeypatch.setattr(updater, "_shadowed", lambda _: None)
     monkeypatch.setattr(updater, "is_service_active", lambda: True)
     monkeypatch.setattr(updater, "restart_service", lambda: (_ for _ in ()).throw(OSError("no bus")))
-    assert updater.run_update(assume_yes=True, fetcher=lambda: release("0.8.1"), runner=lambda _: result()) == 1
+    assert updater.run_update(assume_yes=True, fetcher=lambda: release("0.8.3"), runner=lambda _: result()) == 1
     output = capsys.readouterr()
     assert "updated successfully" in output.out and "could not be restarted" in output.err

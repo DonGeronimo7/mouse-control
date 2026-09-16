@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from mouse_control.discovery import MouseDevice
 from mouse_control.hardware.generic import GenericBackend
+from mouse_control.hardware import HardwareSupervisor
 from mouse_control.hardware.capabilities import DpiState
 from mouse_control.notifications import (DpiEventMonitor, DpiMonitor,
                                          DpiMonitorSupervisor, FreedesktopNotifier,
@@ -359,6 +360,39 @@ def test_supervisor_rebinds_after_watcher_disconnect_and_notifies_again():
     factory.assert_called_once_with(MOUSE)
     second.watch_dpi_events.assert_called_once()
     assert [call.args[0] for call in notifier.notify_dpi.call_args_list] == [1500, 2000]
+
+
+def test_event_monitor_recovers_when_native_arrives_after_generic_fallback():
+    """A provisional Generic bind must be retried until Native HID returns."""
+    first, promoted = event_backend(), event_backend()
+    fallback = GenericBackend()
+    fallback.close = Mock()
+    notifier = Mock()
+    shutdown = ScriptedShutdown()
+    replacements = iter((fallback, GenericBackend(), promoted))
+
+    def disconnect(_device, _callback, _stop, ready):
+        ready()
+        raise OSError("receiver removed")
+
+    def deliver(_device, callback, stop, ready):
+        ready()
+        callback(DpiState(1500, confirmed=True, active_stage=1))
+        stop.set()
+
+    first.watch_dpi_events.side_effect = disconnect
+    promoted.watch_dpi_events.side_effect = deliver
+    hardware = HardwareSupervisor(first, MOUSE, lambda _device: next(replacements))
+    monitor = DpiMonitorSupervisor(hardware, MOUSE, lambda _device: hardware,
+                                   [800, 1500], 800, shutdown, notifier,
+                                   retry_interval=2.0)
+    monitor._run()
+
+    assert hardware.current_backend is promoted
+    assert hardware.generation == 2
+    fallback.close.assert_called_once()
+    promoted.watch_dpi_events.assert_called_once()
+    notifier.notify_dpi.assert_called_once_with(1500)
 
 
 def test_supervisor_rebind_allows_same_first_confirmed_value_after_disconnect():

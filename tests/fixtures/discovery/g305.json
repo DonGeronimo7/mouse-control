@@ -1,0 +1,25 @@
+{
+  "device": {
+    "name": "Logitech G305 LIGHTSPEED",
+    "vendor_id": "0x046d",
+    "product_id": "0x4074",
+    "bus": "usb"
+  },
+  "protocol": {
+    "name": "hidpp2",
+    "version": "4.2",
+    "device_index_observed": "0x01",
+    "feature_ids": {
+      "adjustable_dpi": "0x2201",
+      "report_rate": "0x8060",
+      "onboard_profiles": "0x8100"
+    },
+    "note": "Feature IDs are acceptance facts; runtime feature indexes must still be resolved dynamically through HID++ ROOT."
+  },
+  "dpi": {
+    "minimum": 200,
+    "maximum": 12000,
+    "step": 50
+  },
+  "report_rates_hz": [125, 250, 500, 1000]
+}

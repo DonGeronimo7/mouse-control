@@ -1,164 +1,128 @@
-# AI Development Handoff Log
+# AI handoff log
 
-This is the concise chronological coordination trail between ChatGPT and Codex.
-Read `docs/AI_HANDOFF_PROTOCOL.md` for the full protocol and
-`docs/PROJECT_STATUS.md` for authoritative architectural status.
+## 2026-09-15 — G305 polling acceptance runtime mismatch
 
-## 2026-09-14 — Protocol established
+Request: user attachment `pasted-text.txt`, continuing reviewed commit
+`1c7b23f474f790275573464049c935e8df29971d` on
+`feat/core-hardware-stabilization`.
 
-- ChatGPT and Codex now coordinate through committed Git state rather than chat
-  memory alone.
-- ChatGPT is the project manager/reviewer; Codex is the primary implementation
-  engineer for handed-off coding tasks.
-- Codex startup must read `AGENTS.md`, `docs/AI_HANDOFF_PROTOCOL.md`,
-  `docs/PROJECT_STATUS.md`, and the latest entry here before implementation.
-- Every Codex implementation handoff must identify branch/commit, files and
-  behavior changed, automated and physical validation, remaining risks, and the
-  next bounded task.
-- Validation claims are explicitly separated into code-reviewed, unit-tested,
-  integration-tested, physically validated, and unverified.
-- Repository state and physical evidence take precedence over stale chat
-  descriptions.
+The requested `docs/AI_HANDOFF_PROTOCOL.md` and this log did not exist in the
+checkout, tracked history, or inspected local handoff files. This new entry
+records actual evidence; it does not reconstruct a missing prior handoff.
+The final response follows the user's explicit HANDOFF schema.
 
-### Current coordination focus
+- Failure: physical setup listed `1000/500/250/125` and current `1000`, but
+  disallowed changes before the first `1000 -> 500` write.
+- Root cause: `/usr/bin/mouse-control` imports the old system-installed 0.8.1
+  package. Its `_discover_report_rate` caches writability from current Host
+  mode; its native backend forwards that flag and lacks the transition path.
+  The reviewed checkout already fixes that policy. Version equality hid the
+  deployment mismatch. Actual physical mode was not captured; an Onboard
+  fixture against the installed package reproduces the reported result.
+- Correction: document an explicit source invocation and require CLI/service
+  implementation parity before continuing acceptance. Preserve the existing
+  protocol and safety policy without a superficial wizard override.
+- Regression: 11 new cases use actual driver discovery and native backend,
+  directly and via HardwareSupervisor, through setup selection and application.
+  They cover 500 Hz success, Host failure, rate-write failure, exact-readback
+  mismatch, rollback, and unknown/non-USB/missing-transport identity refusal.
+- Validation: targeted suite 71 passed; full suite 295 passed (one existing
+  GLib deprecation warning); compileall and diff whitespace checks passed.
+- Packaging: `python3 -m build --no-isolation` produces sdist/wheel; local
+  `rpmbuild -ba` with `_topdir=/tmp/mouse-control-acceptance-rpm` and
+  `_tmppath=/tmp` passes, including `%check` (295 tests), compileall, and
+  staged CLI help. The default RPM temporary directory was read-only, so it
+  was redirected to `/tmp`. Wheel installation into an isolated system-site
+  virtual environment and its CLI help both pass. Existing RPM changelog-date
+  and GLib deprecation warnings remain. System installation/service unchanged.
+- Lifecycle review: existing supervisor generation/reconciliation, backend
+  cleanup, canonical DPI/notification, battery, remapping/chord, and shutdown
+  coverage passes. No runtime lifecycle changes were made or physical recovery
+  claims inferred. Setup uses NativeHidBackend directly; daemon consumers use
+  the shared HardwareSupervisor, which forwards polling policy unchanged.
+- Resume: the exact source command in `G305_HARDWARE_ACCEPTANCE.md`, first
+  `1000 -> 500 Hz`. All physical polling and remaining acceptance are pending.
 
-The active investigation is native Logitech HID++ Report Rate (`0x8060`) write
-behavior on the physically validated G305. Read capability and supported-rate
-discovery are established; do not claim native polling-rate write completion
-until a real G305 rate transition is independently confirmed by protocol
-readback/confirmation and physical testing. Preserve evdev remapping and avoid
-unsafe persistent onboard-profile writes while investigating.
+## HOLD — Future Minimal Resident Runtime
 
-## 2026-09-14 — FUTURE HANDOFF: Minimal Resident Runtime
+No prior HOLD entry was available to amend. Preserve the user's architecture
+refinement here for future work; do not implement it in this polling task.
 
-**Status:** HOLD. Do not begin this work until the current native HID++ polling
-rate/onboard-persistence investigation is complete and the user explicitly
-starts this task.
+Steady-state intent: evdev/uinput for remapping and chords; a small extensible
+HID watcher for DPI, reconnect/reset and future hardware/status events; one
+minimal desktop runtime for tray/menu and notifications.
 
-### Goal
+Persist hardware settings onboard where safely validated; otherwise retain
+minimal `DesiredHardwareState` and reconcile only on lifecycle events, never
+continuously merely to maintain configuration. Safe persistent profile
+programming is not a prerequisite for this optimization. A few resident state
+values are acceptable. This work remains **HOLD** pending a separate bounded
+task; no memory/runtime optimization has begun.
 
-Make the steady-state Mouse Control daemon exceptionally lightweight without
-altering behavior. The design principle is that persistent hardware
-configuration belongs in validated onboard mouse memory; the resident daemon
-should retain only state required to react to live events and provide desktop
-integration.
+## 2026-09-15 — Setup remap preservation and DPI-cycle selection
 
-The current user-observed service RSS is approximately 40 MB. Treat that as a
-rough observation, not a benchmark. Establish reproducible RSS, PSS, USS/private
-memory, thread count, idle CPU/wakeups, and loaded-module baselines before making
-optimization claims.
+- Root cause: setup initialized every run from built-in left/right/middle
+  defaults, so Skip/keep mappings regenerated `[remap]` and removed other
+  valid entries such as `BTN_FORWARD = 'dpi-cycle'`. The action menu also did
+  not expose the already-supported `dpi-cycle` action.
+- Correction: seed setup from an existing valid `[remap]` table, overlay only
+  deliberately captured buttons, and offer canonical `dpi-cycle` as action 8.
+  No HID++, Host-mode, polling, backend, or runtime remapping behavior changed;
+  no global `BTN_FORWARD` meaning was added.
+- Validation: targeted setup/wizard/runtime suite passes 58 tests; full suite
+  passes 299 tests (one existing GLib deprecation warning). Compileall and
+  whitespace checks pass.
+- Physical follow-up: confirm `BTN_FORWARD = 'dpi-cycle'`, run setup with
+  Skip/keep mappings, confirm it remains, restart Mouse Control, and verify
+  physical DPI cycling. Only then proceed from verified 500 Hz to 250 Hz.
 
-### Target steady-state architecture
+## 2026-09-15 — Lossless setup configuration editing
 
-The preferred resident architecture is intentionally small:
+- Root cause: in addition to rebuilding remaps, setup discovery replaced
+  configured DPI stages/active DPI and chose the maximum supported polling
+  rate. It then saved and applied those discovery-derived values.
+- Correction: setup now seeds the wizard from parsed persisted values, uses
+  defaults only for missing fields, separates configured polling from observed
+  current polling, and merges changed setup-owned fields while retaining
+  notifications and unknown TOML tables. Hardware discovery is informational;
+  DPI and polling writes occur only after their respective explicit edits.
+- Regression: repeated no-change setup preserves non-default DPI active/stages,
+  500 Hz polling, `dpi-cycle`/key/chord mappings, notifications, and nested
+  future configuration. Isolated DPI, polling, and remap edits preserve the
+  other preferences.
+- Acceptance interpretation: the earlier 500 Hz persistence result remains
+  **inconclusive because setup was still destructive**, not a confirmed Native
+  HID/HID++ regression. Install this build before repeating the physical
+  polling acceptance sequence.
 
-1. **evdev/uinput remapping path** — preserve all existing button mappings,
-   passthrough behavior, keyboard mappings, keyboard chords, reconnect handling,
-   and stuck-key/button release guarantees.
-2. **small extensible HID event watcher** — keep a native event path resident
-   for events that cannot be obtained correctly from evdev. Initially this
-   includes confirmed DPI-change observation needed for immediate OSD behavior;
-   design it so future vendor/device events and battery/status events can plug
-   into the same mechanism. Prefer event-driven hardware observation over
-   polling whenever the protocol exposes equivalent events.
-3. **one desktop-integration runtime** — provide the StatusNotifierItem tray,
-   menu/status surface, and DPI desktop notifications without unnecessary
-   duplicate threads, asyncio loops, queues, or D-Bus connections.
-4. **minimal hotplug/rebind state** required to recover the above paths after a
-   receiver/device disconnect.
+## 2026-09-15 — Reconnect promotion after partial receiver enumeration
 
-Hardware settings such as DPI stages/default DPI and polling rate should not be
-continuously supervised in RAM when the specific device/backend has a physically
-validated, safe onboard-persistence implementation. Configuration commands
-should perform a bounded transaction: discover capabilities -> write validated
-settings -> read back/verify canonical hardware state -> persist onboard when
-safe -> exit.
+Request: user attachment `pasted-text.txt` on
+`feat/core-hardware-stabilization`, beginning at
+`55e4af25667dc448964af3a03de99b97f856cd49`.
 
-For devices without safe writable onboard storage, preserve the existing
-backend behavior required for correct operation. Do not make Logitech/G305
-persistence assumptions generic.
-
-### Required behavior preservation
-
-This task is an architectural/memory optimization, not a feature tradeoff. The
-following behavior is non-negotiable:
-
-- all existing evdev/uinput remaps and passthrough behavior;
-- keyboard mappings and held keyboard chords;
-- current disconnect/reconnect recovery and release of synthetic outputs;
-- configured DPI stages and hardware behavior;
-- an immediate independent desktop notification for every physical DPI-stage
-  press/change that currently produces one, including rapid presses;
-- correct confirmed DPI value in that notification;
-- battery/status tray and menu behavior currently exposed to the user;
-- polling-rate behavior and all hardware-safety restrictions;
-- optional-backend failure must never block ordinary remapping;
-- generic HID remains read-only unless a separately validated protocol driver
-  authorizes writes.
-
-Do not reduce notification frequency, add latency, weaken reconnect handling,
-remove tray/menu functionality, replace event handling with slower polling, or
-silently disable hardware features to improve a memory number.
-
-### Investigation before implementation
-
-Before restructuring the daemon, attribute steady-state memory rather than
-assuming Python objects are responsible. Measure at minimum:
-
-- RSS, PSS, USS/private memory and swap;
-- thread count and thread roles;
-- loaded Python modules on the `mouse-control run` path;
-- number of asyncio event loops and D-Bus connections;
-- idle CPU and practical wakeup frequency;
-- memory after startup, after DPI activity, after tray/menu use, after a
-  disconnect/reconnect, and after an extended idle period.
-
-Quantify the contribution/necessity of command-only imports, DPI supervisor and
-notifier infrastructure, battery monitor/tray infrastructure, HID sessions, and
-other long-lived objects. Prefer lazy command-specific imports where they reduce
-the resident `run` process without complicating behavior.
-
-The existing architecture has separate DPI-notification and battery-tray
-thread/asyncio/D-Bus machinery. Investigate consolidation into one desktop
-runtime, but accept it only if measurements show a worthwhile reduction and the
-behavior/regression burden remains low.
-
-### Acceptance criteria
-
-- Produce reproducible before/after memory measurements on the same system and
-  workload. Report RSS and PSS/private memory; do not market an RSS-only result.
-- Aim first for materially below the current ~40 MB observed RSS. `<25 MB RSS`
-  is a useful initial engineering target and `<20 MB RSS` is a stretch target,
-  not a requirement and never justification for behavioral compromise.
-- Demonstrate no functional regressions with the full automated suite plus
-  targeted lifecycle/concurrency tests.
-- Physically validate the G305 paths affected by the change: remapping/chords,
-  DPI cycling and every-press OSD including rapid presses, battery tray/menu,
-  disconnect/reconnect, and polling behavior relevant to the final architecture.
-- Confirm that steady-state memory does not grow materially after repeated DPI
-  events, tray interactions, and reconnect cycles.
-- Record idle CPU/wakeup impact so a RAM win does not create a power/CPU
-  regression.
-- Keep the small HID watcher extensible through backend/protocol interfaces;
-  do not hard-code the daemon around G305 event payloads.
-
-### Safety / sequencing dependency
-
-Do **not** remove current DPI/polling supervisors merely because onboard storage
-is expected to work. First establish, through the active hardware investigation,
-which settings can be safely persisted and read back on the G305 and what mode
-transitions are required. Persistent ONBOARD_PROFILES writes remain prohibited
-until that path is explicitly proven safe.
-
-When this future task begins, re-read current HEAD and `docs/PROJECT_STATUS.md`.
-The architecture may have changed since this handoff was recorded; adapt the
-plan to repository reality while preserving the intent and acceptance criteria
-above.
-
-### Deliverable
-
-Use a bounded optimization branch. Provide the standard Codex HANDOFF report
-from `docs/AI_HANDOFF_PROTOCOL.md`, including exact before/after measurements,
-commit hash, tests, physical-validation evidence, unresolved risks, and the next
-bounded task. Do not merge, tag, release, or push to `main` without explicit user
-authorization.
+- Physical reproduction: a G305 operating through Native HID/HID++ was
+  unplugged and reinserted. A reconnect probe during partial enumeration bound
+  Generic HID / evdev. Input and remapping later recovered, but Native HID was
+  never reacquired, leaving DPI event monitoring and DPI notifications absent
+  until `mouse-control restart`.
+- Verified root cause: `HardwareSupervisor` cleared `discovery_pending` when
+  Native HID was active but did not restore it after a Generic fallback.
+  `DpiMonitorSupervisor` therefore classified Generic's lack of DPI events as
+  final and stopped issuing short rebind attempts. This is a backend lifecycle
+  and preference defect, not a DBus notification defect.
+- Implementation: preserve Generic as an immediate safe fallback, but mark it
+  provisional after a previously selected non-Generic backend. Repeated
+  Generic-only probes close only their unselected candidate and do not advance
+  the generation. A later Native result replaces and closes Generic, advances
+  the generation, and allows consumers to subscribe on the promoted backend.
+- Regression: added a deterministic Native → Generic → Native supervisor race
+  test that verifies fallback cleanup and generation behavior, plus a DPI
+  monitor test that verifies an event after promotion reaches the notifier.
+- Validation: targeted tests passed (35 tests); full suite passed (305 tests,
+  one existing GLib deprecation warning); compileall and diff whitespace checks
+  passed.
+- Physical follow-up: reinstall/use the matching source build, remove and
+  reinsert the G305 receiver, and verify that the temporary Generic bind is
+  followed by Native HID promotion and resumed one-notification-per-DPI press.
+  That physical receiver-reinsert validation remains pending.

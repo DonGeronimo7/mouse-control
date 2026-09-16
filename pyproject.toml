@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mouse-control"
-version = "0.8.0"
+version = "0.8.2"
 description = "Headless mouse remapper with native HID and optional OpenRazer hardware support"
 authors = [
     {name = "Marc-A. Geronimo"}
@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 mouse-control = "mouse_control.cli:main"
+mouse-control-discover = "mouse_control.discovery_cli:main"
 
 [tool.setuptools.package-data]
 mouse_control = ["udev/*.rules"]

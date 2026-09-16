@@ -1,3 +1,17 @@
+mouse-control (0.8.2-1) unstable; urgency=medium
+
+  * Stabilize native hardware control and reconnect fallback behavior.
+  * Preserve remaps and setup configuration during hardware setup.
+
+ -- Marc-Anthony Geronimo <DonGeronimo7@users.noreply.github.com>  Mon, 15 Sep 2026 05:00:00 +0000
+
+mouse-control (0.8.1-1) unstable; urgency=medium
+
+  * Improve revisitable setup, live numeric DPI testing, and safe rollback.
+  * Display readable polling capabilities and save accepted DPI stages.
+
+ -- Marc-Anthony Geronimo <DonGeronimo7@users.noreply.github.com>  Mon, 14 Sep 2026 19:30:00 +0000
+
 mouse-control (0.8.0-1) unstable; urgency=medium
 
   * Add held keyboard chord bindings with safe shared-modifier and disconnect cleanup.

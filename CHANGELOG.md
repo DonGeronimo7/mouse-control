@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.2 — 2026-09-15
+
+- Preserve valid remaps, configurable `dpi-cycle`, untouched DPI/polling
+  settings, and unrelated configuration through setup.
+- Restrict setup hardware writes to explicit relevant edits; recover from a
+  temporary Generic HID/evdev fallback by promoting back to the preferred
+  backend with DPI monitoring, notifications, and state reconciliation.
+- Known temporary UX issue: the built-in updater can wait for invisible input.
+  Type `y` and Enter to continue; this does not apply to `update --yes`.
+  Planned for correction in the next development cycle.
+
+## 0.8.1 — 2026-09-14
+
+- Make setup revisitable, with numeric live DPI testing and Back/Cancel rollback.
+- Show readable polling rates and offer selection only when safe writes are supported.
+- Save accepted DPI stages so runtime cycling uses the reviewed values.
+
 ## 0.8.0 — 2026-09-14
 
 - Add held keyboard chord bindings, setup capture, shared-modifier handling,

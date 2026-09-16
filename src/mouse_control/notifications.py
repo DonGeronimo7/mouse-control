@@ -99,9 +99,11 @@ class DpiMonitor:
         if close := getattr(self.notifier, "close", None): close()
 
 class DpiEventMonitor:
-    def __init__(self, backend, device, stages, active_dpi, notifier=None, shutdown_event=None, log_errors=True):
+    def __init__(self, backend, device, stages, active_dpi, notifier=None, shutdown_event=None, log_errors=True, dpi_cycler=None):
         self.backend, self.device, self.notifier = backend, device, notifier or FreedesktopNotifier(); self.shutdown_event = shutdown_event or threading.Event()
         self._last_notified_dpi = None; self._state_lock = threading.Lock(); self._thread = None; self.log_errors = log_errors
+        self.dpi_cycler = dpi_cycler
+        self._last_stage = None
     def notify_dpi(self, dpi):
         with self._state_lock:
             if dpi == self._last_notified_dpi: return False
@@ -109,8 +111,25 @@ class DpiEventMonitor:
             except Exception as exc: LOG.warning("Desktop DPI notification failed: %s", exc); return False
             self._last_notified_dpi = dpi
         return True
+    def notify_deliberate_dpi(self, dpi):
+        with self._state_lock:
+            try: self.notifier.notify_dpi(dpi)
+            except Exception as exc: LOG.warning("Desktop DPI notification failed: %s", exc); return False
+            self._last_notified_dpi = dpi
+        return True
     def handle_state(self, state):
         if not state.confirmed or state.x_dpi <= 0: LOG.warning("Ignoring unconfirmed hardware DPI state"); return
+        if self.dpi_cycler is not None and state.active_stage is not None:
+            # A physical press advances the onboard slot. Repeated reports for
+            # that slot, including our live-write echo, are one transition.
+            if state.active_stage == self._last_stage:
+                return
+            self._last_stage = state.active_stage
+            self.dpi_cycler.backend = self.backend
+            self.dpi_cycler.cycle()
+            return
+        if self.dpi_cycler is not None and state.active_stage is None:
+            self.dpi_cycler.observe_dpi(state.display_value)
         if self.notify_dpi(state.display_value): LOG.info("Hardware DPI changed to %s (stage %s)", state.display_value, state.active_stage)
     def _run(self, ready_callback=None):
         try: self.backend.watch_dpi_events(self.device, self.handle_state, self.shutdown_event, ready_callback)
@@ -127,12 +146,22 @@ class DpiEventMonitor:
 
 class DpiMonitorSupervisor:
     """Freshly discover a backend after every unavailable or failed watcher."""
-    def __init__(self, backend, device, backend_factory, stages, active_dpi, shutdown_event, notifier=None, retry_interval=1.):
+    def __init__(self, backend, device, backend_factory, stages, active_dpi, shutdown_event, notifier=None, retry_interval=1., dpi_cycler=None, notifications_enabled=True):
         self.backend, self.device, self.backend_factory, self.stages = backend, device, backend_factory, stages; self.shutdown_event = shutdown_event; self.notifier = notifier or FreedesktopNotifier(); self.retry_interval = retry_interval
         self._last_notified_dpi = None; self._state_lock = threading.Lock(); self._thread = None; self._watcher_bound = False; self._state = MonitorState.UNBOUND
+        self.dpi_cycler = dpi_cycler
+        self.notifications_enabled = notifications_enabled
     def notify_dpi(self, dpi):
+        if not self.notifications_enabled: return False
         with self._state_lock:
             if dpi == self._last_notified_dpi: return False
+            try: self.notifier.notify_dpi(dpi)
+            except Exception as exc: LOG.warning("Desktop DPI notification failed: %s", exc); return False
+            self._last_notified_dpi = dpi
+        return True
+    def notify_deliberate_dpi(self, dpi):
+        if not self.notifications_enabled: return False
+        with self._state_lock:
             try: self.notifier.notify_dpi(dpi)
             except Exception as exc: LOG.warning("Desktop DPI notification failed: %s", exc); return False
             self._last_notified_dpi = dpi
@@ -143,13 +172,16 @@ class DpiMonitorSupervisor:
     def _run(self):
         backend, unavailable = self.backend, False
         while not self.shutdown_event.is_set():
+            generation = getattr(backend, "generation", None)
+            unsupported = False
             try:
                 if start := getattr(self.notifier, "start", None): start()
                 with self._state_lock: self._watcher_bound = False; self._state = MonitorState.BINDING
-                monitor = create_dpi_monitor(backend, self.device, shutdown_event=self.shutdown_event, stages=self.stages, notifier=self, log_failure=False)
+                monitor = create_dpi_monitor(backend, self.device, shutdown_event=self.shutdown_event, stages=self.stages, notifier=self, log_failure=False, dpi_cycler=self.dpi_cycler)
                 if monitor is None:
                     if not unavailable: LOG.warning("DPI monitoring unavailable; retrying")
                     unavailable = True
+                    unsupported = not getattr(backend, "discovery_pending", True)
                 else:
                     monitor._run(self._watcher_ready)
                     if not self.shutdown_event.is_set():
@@ -159,10 +191,18 @@ class DpiMonitorSupervisor:
             except Exception as exc:
                 if not unavailable: LOG.warning("DPI monitoring unavailable; retrying: %s", exc)
                 unavailable = True
+            if unsupported:
+                if self.shutdown_event.wait(max(30., self.retry_interval)):
+                    break
+                continue
             if self.shutdown_event.is_set() or self.shutdown_event.wait(self.retry_interval): break
             try:
-                if close := getattr(backend, "close", None): close()
-                backend = self.backend_factory(self.device)
+                rebind = getattr(type(backend), "rebind", None)
+                if callable(rebind):
+                    rebind(backend, generation)
+                else:
+                    if close := getattr(backend, "close", None): close()
+                    backend = self.backend_factory(self.device)
             except Exception as exc: LOG.debug("DPI backend discovery unavailable: %s", exc)
     def start(self): self._thread = threading.Thread(target=self._run, name="dpi-monitor-supervisor", daemon=True); self._thread.start()
     def stop(self):
@@ -171,10 +211,10 @@ class DpiMonitorSupervisor:
         if self._thread: self._thread.join(timeout=max(1., self.retry_interval+.5))
         if close := getattr(self.notifier, "close", None): close()
 
-def create_dpi_monitor(backend, device, enabled=True, shutdown_event=None, stages=None, active_dpi=0, notifier=None, log_failure=True):
+def create_dpi_monitor(backend, device, enabled=True, shutdown_event=None, stages=None, active_dpi=0, notifier=None, log_failure=True, dpi_cycler=None):
     if not enabled: return None
     try:
-        if backend.supports_dpi_events(device) is True: return DpiEventMonitor(backend, device, stages or [], active_dpi, notifier, shutdown_event, log_failure)
+        if backend.supports_dpi_events(device) is True: return DpiEventMonitor(backend, device, stages or [], active_dpi, notifier, shutdown_event, log_failure, dpi_cycler)
         if not backend.supports_dpi_monitoring(device): return None
     except Exception as exc:
         if log_failure: LOG.warning("DPI monitoring is unavailable: %s", exc)

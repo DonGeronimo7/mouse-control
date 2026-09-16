@@ -265,7 +265,7 @@ class StatusNotifierTray:
 
 
 class BatteryMonitorSupervisor:
-    """Slow, independent polling; disconnects hide the item and trigger rediscovery."""
+    """Slow battery polling through the shared hardware lifecycle owner."""
     def __init__(self, backend: HardwareBackend, device, backend_factory, shutdown_event,
                  tray=None, interval: float = 60., retry_interval: float = 1.) -> None:
         self.backend, self.device, self.backend_factory = backend, device, backend_factory
@@ -277,8 +277,14 @@ class BatteryMonitorSupervisor:
         backend = self.backend
         shown = False
         while not self.shutdown_event.is_set():
+            generation = getattr(backend, "generation", None)
             try:
                 if not backend.supports_battery(self.device):
+                    if not getattr(backend, "discovery_pending", True):
+                        self._consecutive_failures = 0
+                        if self.shutdown_event.wait(self.interval):
+                            break
+                        continue
                     raise RuntimeError("battery unavailable")
                 state = backend.get_battery_state(self.device)
                 if state is None or state.percentage is None:
@@ -300,9 +306,13 @@ class BatteryMonitorSupervisor:
                               self._consecutive_failures, 3, exc)
             if self.shutdown_event.wait(self.retry_interval): break
             try:
-                close = getattr(backend, "close", None)
-                if close: close()
-                backend = self.backend_factory(self.device)
+                rebind = getattr(type(backend), "rebind", None)
+                if callable(rebind):
+                    rebind(backend, generation)
+                else:
+                    close = getattr(backend, "close", None)
+                    if close: close()
+                    backend = self.backend_factory(self.device)
             except Exception as exc:
                 LOG.debug("Battery backend rediscovery unavailable: %s", exc)
         self.tray.close()

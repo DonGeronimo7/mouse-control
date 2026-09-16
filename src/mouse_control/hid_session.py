@@ -5,12 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import os
+import logging
 from pathlib import Path
 import select
 import threading
 
 from .hidpp import (DISCOVERY_SOFTWARE_ID, HidppError, HidppReport,
                     parse_hidpp_report)
+
+LOG = logging.getLogger(__name__)
 
 
 class HidrawIo:
@@ -50,6 +53,7 @@ class HidSession:
         self._state_lock = threading.Lock()
         self._waiter: tuple[tuple[int, int, int, int], _Waiter] | None = None
         self._callbacks: list[Callable[[HidppReport], None]] = []
+        self._callback_failures: dict[Callable[[HidppReport], None], int] = {}
         self._stop = threading.Event()
         self._io_closed = False
         self._thread = threading.Thread(target=self._read_loop,
@@ -63,6 +67,7 @@ class HidSession:
             with self._state_lock:
                 if callback in self._callbacks:
                     self._callbacks.remove(callback)
+                self._callback_failures.pop(callback, None)
         return unsubscribe
 
     @property
@@ -128,9 +133,17 @@ class HidSession:
         for callback in callbacks:
             try:
                 callback(report)
-            except Exception:
+                self._callback_failures.pop(callback, None)
+            except Exception as exc:
                 # A consumer cannot kill the sole reader.
-                continue
+                failures = self._callback_failures.get(callback, 0) + 1
+                self._callback_failures[callback] = failures
+                # Log the first and exponentially spaced repeats. HID++ event
+                # handling is low-volume, but a broken subscriber must not
+                # flood logs or become invisible.
+                if failures & (failures - 1) == 0:
+                    LOG.warning("HID event subscriber failed (%d consecutive): %s",
+                                failures, exc, exc_info=True)
 
     def _read_loop(self) -> None:
         failure: Exception | None = None

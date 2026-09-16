@@ -29,6 +29,8 @@ MODE_STATUS_FEATURE_ID = 0x8090
 UNIFIED_BATTERY_FEATURE_ID = 0x1004
 BATTERY_STATUS_FEATURE_ID = 0x1000
 BATTERY_VOLTAGE_FEATURE_ID = 0x1001
+ONBOARD_MODE = 0x01
+HOST_MODE = 0x02
 
 
 def decode_unified_battery(parameters: bytes) -> BatteryState:
@@ -196,15 +198,28 @@ class Hidpp20Driver:
         flags = response.parameters[0]
         values = tuple(1000 // milliseconds for milliseconds in range(1, 9)
                        if flags & (1 << (milliseconds - 1)))
-        profiles = self.features.get(ONBOARD_PROFILES_FEATURE_ID)
-        writable = False
-        if profiles is not None:
-            mode = self.session.request(self.device_index, profiles.index, 0x02)
-            if not mode.parameters or mode.parameters[0] not in (0x01, 0x02):
-                raise HidppError("malformed onboard-profiles mode response")
-            writable = mode.parameters[0] == 0x02
+        # The driver describes protocol mechanics. Whether Mouse Control may
+        # enter Host mode is a device-specific policy decision in the backend.
+        writable = ONBOARD_PROFILES_FEATURE_ID in self.features
         return ReportRateCapabilities(readable=bool(values), writable=writable,
                                       values=values)
+
+    def get_control_mode(self) -> int:
+        feature = self.features.get(ONBOARD_PROFILES_FEATURE_ID)
+        if feature is None:
+            raise HidppError("onboard-profiles control mode is unsupported")
+        response = self.session.request(self.device_index, feature.index, 0x02)
+        if not response.parameters or response.parameters[0] not in (ONBOARD_MODE, HOST_MODE):
+            raise HidppError("malformed onboard-profiles mode response")
+        return response.parameters[0]
+
+    def set_control_mode(self, mode: int) -> None:
+        if mode not in (ONBOARD_MODE, HOST_MODE):
+            raise HidppError(f"invalid onboard-profiles control mode 0x{mode:02x}")
+        feature = self.features.get(ONBOARD_PROFILES_FEATURE_ID)
+        if feature is None:
+            raise HidppError("onboard-profiles control mode is unsupported")
+        self.session.request(self.device_index, feature.index, 0x01, bytes((mode,)))
 
     def get_dpi_state(self, *, active_stage: int | None = None) -> DpiState:
         feature = self.features.get(ADJUSTABLE_DPI_FEATURE_ID)
@@ -225,8 +240,10 @@ class Hidpp20Driver:
         self.session.request(self.device_index, feature.index, 0x03,
                              bytes((0,)) + dpi.to_bytes(2, "big"))
         state = self.get_dpi_state()
-        if state.x_dpi != dpi:
-            raise HidppError(f"DPI verification failed: requested {dpi}, read {state.x_dpi}")
+        if state.x_dpi != dpi or state.y_dpi not in (None, 0, dpi):
+            raise HidppError(
+                f"DPI verification failed: requested {dpi}, "
+                f"read {state.display_value}")
         return state
 
     def get_report_rate(self) -> int:

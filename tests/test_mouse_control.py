@@ -33,13 +33,15 @@ def test_parse_actions():
 
 
 def test_config_contains_executable_actions():
-    mouse = MouseDevice("Test Mouse", "/dev/input/test", phys="usb-test", vendor=0x046D, product=0xC332)
+    mouse = MouseDevice("Test Mouse", "/dev/input/test", phys="usb-test",
+                        vendor=0x046D, product=0xC332, bustype=3)
     content = generate_config(
         mouse,
         {"BTN_LEFT": "passthrough", "BTN_SIDE": "key:KEY_LEFTCTRL"},
         active_dpi=1600,
     )
     assert "phys = 'usb-test'" in content
+    assert "bustype = 3" in content
     assert "BTN_SIDE" in content
     assert "key:KEY_LEFTCTRL" in content
     assert "active = 1600" in content
@@ -48,6 +50,11 @@ def test_config_contains_executable_actions():
     assert "stages = [800, 1500, 2000, 2500, 3000]" in generate_config(
         mouse, {}, dpi_stages=DEFAULT_DPI_STAGES, active_dpi=DEFAULT_DPI
     )
+
+
+def test_explicit_empty_dpi_stage_list_is_not_replaced_by_defaults():
+    mouse = MouseDevice("Test", "/dev/input/test")
+    assert "stages = []" in generate_config(mouse, {}, dpi_stages=[])
 
 
 def test_service_quotes_the_resolved_executable_path():

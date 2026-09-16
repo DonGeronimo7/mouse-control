@@ -32,6 +32,9 @@ def test_generic_hid_discovery_matches_exact_identity_and_keeps_interfaces(tmp_p
 
 def test_generic_hid_discovery_requires_usb_identity(tmp_path):
     assert discover_hid_devices(MouseDevice("unknown", "/test"), sysfs=tmp_path) == []
+    assert discover_hid_devices(
+        MouseDevice("missing transport", "/test", vendor=0x046d, product=0x4074),
+        sysfs=tmp_path) == []
 
 
 def test_generic_hid_discovery_respects_bluetooth_transport(tmp_path):

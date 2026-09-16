@@ -9,7 +9,8 @@ from mouse_control.hardware.capabilities import BatteryState, DpiState
 from mouse_control.hid_session import HidSession
 from mouse_control.hidpp import HidppError, HidppReport
 from mouse_control.hidpp_driver import (ADJUSTABLE_DPI_FEATURE_ID,
-    ONBOARD_PROFILES_FEATURE_ID, REPORT_RATE_FEATURE_ID, BATTERY_STATUS_FEATURE_ID, Hidpp20Driver,
+    HOST_MODE, ONBOARD_MODE, ONBOARD_PROFILES_FEATURE_ID, REPORT_RATE_FEATURE_ID,
+    BATTERY_STATUS_FEATURE_ID, Hidpp20Driver,
     connect_hidpp20,
     decode_supported_dpi)
 from mouse_control.hidpp_driver import (UNIFIED_BATTERY_FEATURE_ID,
@@ -53,6 +54,21 @@ def test_session_correlates_reply_while_dispatching_unsolicited_event():
     session.close()
     assert response.parameters[:2] == b"\x02\x00"
     assert [(event.feature_index, event.software_id) for event in events] == [(0x12, 0)]
+
+
+def test_subscriber_failure_is_logged_without_killing_other_consumers(caplog):
+    session = HidSession(Path("/dev/fake"), io_factory=QueueIo)
+    delivered = []
+    def broken(_report):
+        raise RuntimeError("subscriber bug")
+    session.subscribe(broken)
+    session.subscribe(delivered.append)
+    report = HidppReport(0x11, 1, 0x12, 1, 0, b"\x01")
+    for _ in range(3):
+        session._dispatch(report)
+    session.close()
+    assert delivered == [report, report, report]
+    assert caplog.text.count("HID event subscriber failed") == 2
 
 
 def test_session_routes_protocol_error_to_waiter():
@@ -129,6 +145,9 @@ class FakeSession:
             result = b"\x8b"  # 1, 2, 4 and 8 ms
         elif feature == 0x12 and function == 2:
             result = bytes((self.profile_mode,))
+        elif feature == 0x12 and function == 1:
+            self.profile_mode = parameters[0]
+            result = b"\0"
         elif feature == 0x17 and function == 1:
             result = bytes((self.rate_ms,))
         elif feature == 0x17 and function == 2:
@@ -187,18 +206,18 @@ def test_g305_dynamic_battery_status_runtime_path():
     assert driver.capabilities.battery.readable
 
 
-def test_report_rate_remains_readable_but_not_writable_in_onboard_mode():
+def test_report_rate_protocol_mechanics_are_available_in_onboard_mode():
     session = FakeSession(profile_mode=0x01)
     driver = Hidpp20Driver(session, 1)
     caps = driver.capabilities.report_rate
     assert caps.readable
-    assert not caps.writable
+    assert caps.writable
     assert caps.values == (1000, 500, 250, 125)
     assert driver.get_report_rate() == 500
-    calls_before_write = list(session.calls)
-    with pytest.raises(HidppError, match="unsupported report rate"):
-        driver.set_report_rate(1000)
-    assert session.calls == calls_before_write
+    assert driver.get_control_mode() == ONBOARD_MODE
+    driver.set_control_mode(HOST_MODE)
+    assert driver.get_control_mode() == HOST_MODE
+    assert driver.set_report_rate(1000) == 1000
 
 
 def test_report_rate_is_writable_in_host_mode():
@@ -230,7 +249,7 @@ def test_onboard_profiles_v0_supports_dpi_events():
     driver = Hidpp20Driver(VersionZeroProfiles(profile_mode=0x01), 1)
     assert driver.features[ONBOARD_PROFILES_FEATURE_ID].version == 0
     assert driver.capabilities.dpi.events
-    assert not driver.capabilities.report_rate.writable
+    assert driver.capabilities.report_rate.writable
 
 
 def test_profile_event_is_resolved_by_live_dpi_query():
@@ -301,3 +320,108 @@ def test_zero_responders_are_rejected():
 
     with pytest.raises(HidppError, match=r"no HID\+\+ 2 device index responded"):
         connect_hidpp20(NoResponders())
+
+
+@pytest.mark.parametrize("supervised", [False, True])
+@pytest.mark.parametrize("failure", [None, "host", "write", "readback"])
+def test_g305_onboard_polling_choices_reach_verified_transaction(
+        monkeypatch, capsys, caplog, supervised, failure):
+    """Exercise ROOT discovery through setup, without replacing capability booleans."""
+    from types import SimpleNamespace
+    from mouse_control.cli import _apply_hardware
+    from mouse_control.discovery import MouseDevice
+    from mouse_control.hardware import HardwareSupervisor
+    from mouse_control.hardware.native_hid import NativeHidBackend
+    from mouse_control.setup_flow import SetupChoices, discover_choices, polling_screen
+
+    class AcceptanceSession(FakeSession):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        def request(self, device, feature, function, parameters=b""):
+            if feature == 0x12 and function == 1 and parameters == bytes((HOST_MODE,)) and failure == "host":
+                raise HidppError("Host transition failed")
+            if feature == 0x17 and function == 2:
+                if failure == "write":
+                    raise HidppError("report-rate write failed")
+                if failure == "readback":
+                    self.calls.append((device, feature, function, parameters))
+                    return HidppReport(0x11, device, feature, function, 0x0a, b"\0")
+            return super().request(device, feature, function, parameters)
+
+    session = AcceptanceSession(profile_mode=ONBOARD_MODE)
+    session.rate_ms = 1
+    device = MouseDevice("G305", "/dev/fake", vendor=0x046d, product=0x4074, bustype=3)
+    backend = NativeHidBackend(
+        discovery=lambda _device: [SimpleNamespace(path="/dev/fake")],
+        session_factory=lambda _path: session,
+        connectors=(lambda selected: Hidpp20Driver(selected, 4),))
+    if supervised:
+        backend = HardwareSupervisor(backend, device, lambda _device: pytest.fail("unexpected rebind"))
+    try:
+        choices = SetupChoices()
+        discover_choices(backend, device, choices)
+        assert choices.polling_rates == [1000, 500, 250, 125]
+        assert choices.current_polling_rate == 1000
+        assert choices.polling_writable
+        assert session.profile_mode == ONBOARD_MODE
+        assert not any(c[1:3] in ((0x12, 1), (0x17, 2)) for c in session.calls)
+        answers = iter(("2", ""))
+        monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+        polling_screen(choices)
+        output = capsys.readouterr().out
+        assert "2. 500 Hz" in output
+        assert "changes are unavailable" not in output
+        assert choices.polling_rate == 500
+        session.calls.clear()
+        _apply_hardware(backend, device, [], 0, choices.polling_rate, setup=True)
+        output = capsys.readouterr().out
+        if failure:
+            assert "set and verified" not in output
+            assert "Could not apply Native HID polling settings" in caplog.text
+            assert session.profile_mode == ONBOARD_MODE
+            assert session.calls[-2:] == [(4, 0x12, 1, b"\x01"), (4, 0x12, 2, b"")]
+            if failure == "host":
+                assert not any(c[1:3] == (0x17, 2) for c in session.calls)
+        else:
+            assert "set and verified at 500 Hz" in output
+            assert session.profile_mode == HOST_MODE
+            assert session.rate_ms == 2
+            assert session.calls == [
+                (4, 0x12, 2, b""),  # capability policy
+                (4, 0x12, 2, b""),  # transaction rechecks mode
+                (4, 0x12, 1, b"\x02"), (4, 0x12, 2, b""),
+                (4, 0x17, 2, b"\x02"), (4, 0x17, 1, b""),
+                (4, 0x17, 1, b""),  # setup verifies independently
+            ]
+    finally:
+        backend.close()
+    assert session.closed
+
+
+@pytest.mark.parametrize("product,bustype", [(0x9999, 3), (0x4074, 5), (0x4074, None)])
+def test_onboard_polling_choices_require_exact_validated_identity(product, bustype):
+    from types import SimpleNamespace
+    from mouse_control.discovery import MouseDevice
+    from mouse_control.hardware.native_hid import NativeHidBackend
+    from mouse_control.setup_flow import SetupChoices, discover_choices
+
+    session = FakeSession(profile_mode=ONBOARD_MODE)
+    driver = Hidpp20Driver(session, 4)
+    device = MouseDevice("G305", "/dev/fake", vendor=0x046d, product=product, bustype=bustype)
+    backend = NativeHidBackend(
+        discovery=lambda _device: [SimpleNamespace(path="/dev/fake")],
+        session_factory=lambda _path: SimpleNamespace(closed=False, close=lambda: None),
+        connectors=(lambda _session: driver,))
+    try:
+        choices = SetupChoices()
+        discover_choices(backend, device, choices)
+        assert choices.polling_readable
+        assert not choices.polling_writable
+        assert choices.polling_rate is None
+        assert session.profile_mode == ONBOARD_MODE
+        assert not any(c[1:3] in ((0x12, 1), (0x17, 2)) for c in session.calls)
+    finally:
+        backend.close()
